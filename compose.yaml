@@ -1,0 +1,128 @@
+networks:
+  pulsar:
+    driver: bridge
+volumes:
+  pulsar-setup:
+    driver: local
+
+services:
+  # Start zookeeper
+  zookeeper:
+    image: apachepulsar/pulsar:v4.0.0
+    container_name: zookeeper
+    restart: on-failure
+    networks:
+      - pulsar
+    volumes:
+      - ./data/zookeeper:/pulsar/data/zookeeper
+    environment:
+      - metadataStoreUrl=zk:zookeeper:2181
+      - PULSAR_MEM=-Xms256m -Xmx256m -XX:MaxDirectMemorySize=256m
+    command: >
+      bash -c "bin/apply-config-from-env.py conf/zookeeper.conf && \
+             bin/generate-zookeeper-config.sh conf/zookeeper.conf && \
+             exec bin/pulsar zookeeper"
+    healthcheck:
+      test: ["CMD", "bin/pulsar-zookeeper-ruok.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 30 
+  # Init cluster metadata
+  pulsar-init:
+    container_name: pulsar-init
+    hostname: pulsar-init
+    image: apachepulsar/pulsar:v4.0.0
+    networks:
+      - pulsar
+    command: >
+      bash -c "bin/pulsar initialize-cluster-metadata \
+      --cluster cluster-a \
+      --zookeeper zookeeper:2181 \
+      --configuration-store zookeeper:2181 \
+      --web-service-url http://broker:8080 \
+      --broker-service-url pulsar://broker:6650"
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+  # Start bookie
+  bookie:
+    image: apachepulsar/pulsar:v4.0.0
+    container_name: bookie
+    restart: on-failure
+    networks:
+      - pulsar
+    environment:
+      - clusterName=cluster-a
+      - zkServers=zookeeper:2181
+      - metadataServiceUri=metadata-store:zk:zookeeper:2181
+      # otherwise every time we run docker compose uo or down we fail to start due to Cookie
+      # See: https://github.com/apache/bookkeeper/blob/405e72acf42bb1104296447ea8840d805094c787/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/Cookie.java#L57-68
+      - advertisedAddress=bookie
+      - BOOKIE_MEM=-Xms512m -Xmx512m -XX:MaxDirectMemorySize=256m
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+      pulsar-init:
+        condition: service_completed_successfully
+    # Map the local directory to the container to avoid bookie startup failure due to insufficient container disks.
+    volumes:
+      - ./data/bookkeeper:/pulsar/data/bookkeeper
+    command: bash -c "bin/apply-config-from-env.py conf/bookkeeper.conf && exec bin/pulsar bookie"
+
+  # Start broker
+  broker:
+    image: apachepulsar/pulsar:v4.0.0
+    container_name: broker
+    hostname: broker
+    restart: on-failure
+    networks:
+      - pulsar
+    environment:
+      - metadataStoreUrl=zk:zookeeper:2181
+      - zookeeperServers=zookeeper:2181
+      - clusterName=cluster-a
+      - managedLedgerDefaultEnsembleSize=1
+      - managedLedgerDefaultWriteQuorum=1
+      - managedLedgerDefaultAckQuorum=1
+      - advertisedAddress=broker
+      - advertisedListeners=external:pulsar://127.0.0.1:6650
+      - PULSAR_MEM=-Xms512m -Xmx512m -XX:MaxDirectMemorySize=256m
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+      bookie:
+        condition: service_started
+    ports:
+      - "6650:6650"
+      - "8080:8080"
+    command: bash -c "bin/apply-config-from-env.py conf/broker.conf && exec bin/pulsar broker" 
+  # Start UI
+  pulsar-manager:
+    image: apachepulsar/pulsar-manager:v0.4.0
+    container_name: pulsar-manager
+    restart: always
+    networks:
+      - pulsar
+    ports:
+      - "7750:7750"
+      - "9527:9527"
+    environment:
+      - SPRING_CONFIGURATION_FILE=/pulsar-manager/pulsar-manager/application.properties
+    stdin_open: true
+    tty: true
+
+    #Run the following command in terminal to start the services in detached mode using Docker Compose:
+    #docker-compose up -d
+    #Ater starting, open a terminal in the Pulsar Manager container:
+    #docker exec -it pulsar-manager /bin/bash
+    #Retrieve the CSRF token required for secure communication with the Pulsar Manager API.
+    #Copy and paste in terminal: CSRF_TOKEN=$(curl http://localhost:7750/pulsar-manager/csrf-token)
+    #Creates a superuser in Pulsar Manager with the specified credentials and details:
+    #Copy and paste: curl -H "X-XSRF-TOKEN: $CSRF_TOKEN" -H "Cookie: XSRF-TOKEN=$CSRF_TOKEN;" -H "Content-Type: application/json" -X PUT http://localhost:7750/pulsar-manager/users/superuser -d '{"name": "admin", "password": "apachepulsar", "description": "test", "email": "username@test.org"}'
+    #exit container terminal.
+    #Access the Pulsar Manager Admin UI by navigating to the following URL in your browser: http://localhost:9527/
+    #Login using: user: admin / password: apachepulsar
+    #Create a new environment in Pulsar Manager with the following details:
+    #Service URL: http://broker:8080
+    #Bookie URL: http://localhost:8080/admin/v2/bookies
+    #These URLs are used to configure the connection to the Pulsar broker and bookie services for managing and monitoring the Pulsar cluster.
